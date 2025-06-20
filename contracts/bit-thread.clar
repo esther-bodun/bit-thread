@@ -659,3 +659,78 @@
         {
           boost-amount: (+ current-boost-amount verified-boost-amount),
           boosted-by: (unwrap! (as-max-len? (append current-boosted-by tx-sender) u20) err-unauthorized)
+          }
+      )
+    )
+    
+    ;; Allocate staked tokens to boost
+    (map-set user-stakes
+      { user: tx-sender }
+      (merge stake-info { amount: (- (get amount stake-info) boost-amount) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; CONTENT MODERATION
+
+;; Toggle thread lock status (author only)
+(define-public (toggle-thread-lock (thread-id uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get author thread-info)) err-unauthorized)
+    
+    (map-set threads
+      { thread-id: thread-id }
+      (merge thread-info { is-locked: (not (get is-locked thread-info)) })
+    )
+    
+    (ok (not (get is-locked thread-info)))
+  )
+)
+
+;; NFT MILESTONES
+
+;; Mint achievement NFT for viral threads
+(define-public (mint-milestone-nft (thread-id uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get author thread-info)) err-unauthorized)
+    (asserts! (>= (get upvotes thread-info) u100) err-unauthorized)
+    
+    (try! (nft-mint? thread-milestone thread-id tx-sender))
+    (ok thread-id)
+  )
+)
+
+;; ADMIN FUNCTIONS
+
+;; Update platform fee structure
+(define-public (set-platform-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u1000) err-invalid-amount)
+    (var-set platform-fee-rate new-rate)
+    (ok true)
+  )
+)
+
+;; Adjust minimum staking requirements
+(define-public (set-min-stake-amount (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-amount u0) err-invalid-amount)
+    (var-set min-stake-amount new-amount)
+    (ok true)
+  )
+)
+
+;; Update platform treasury address
+(define-public (set-platform-treasury (new-treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (is-eq new-treasury 'SP000000000000000000002Q6VF78)) err-invalid-amount)
+    (var-set platform-treasury new-treasury)
+    (ok true)
+  )
+)
+
