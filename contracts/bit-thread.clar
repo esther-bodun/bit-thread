@@ -462,3 +462,102 @@
     (ok true)
   )
 )
+
+;; TIPPING ECONOMY
+
+;; Send STX tip to thread author
+(define-public (tip-thread (thread-id uint) (amount uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
+        (author (get author thread-info)))
+    
+    (asserts! (> amount u0) err-invalid-tip)
+    (asserts! (not (is-eq tx-sender author)) err-self-tip)
+    
+    (let ((platform-fee (calculate-platform-fee amount))
+          (author-payment (- amount platform-fee)))
+      
+      ;; Transfer tip to author
+      (try! (stx-transfer? author-payment tx-sender author))
+      
+      ;; Platform fee collection
+      (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+      
+      ;; Update thread tip tracking
+      (map-set threads
+        { thread-id: thread-id }
+        (merge thread-info { tips-received: (+ (get tips-received thread-info) amount) })
+      )
+      
+      ;; Update reputation metrics
+      (let ((sender-rep (get-user-reputation tx-sender))
+            (author-rep (get-user-reputation author)))
+        
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge sender-rep { tips-sent: (+ (get tips-sent sender-rep) amount) })
+        )
+        
+        (map-set user-reputation
+          { user: author }
+          (merge author-rep { tips-received: (+ (get tips-received author-rep) amount) })
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Send STX tip to reply author
+(define-public (tip-reply (reply-id uint) (amount uint))
+  (let ((reply-info (unwrap! (get-reply reply-id) err-not-found))
+        (author (get author reply-info)))
+    
+    (asserts! (is-valid-reply-id reply-id) err-not-found)
+    (asserts! (> amount u0) err-invalid-tip)
+    (asserts! (not (is-eq tx-sender author)) err-self-tip)
+    
+    (let ((platform-fee (calculate-platform-fee amount))
+          (author-payment (- amount platform-fee))
+          (validated-reply-id reply-id))
+      
+      ;; Transfer tip to author
+      (try! (stx-transfer? author-payment tx-sender author))
+      
+      ;; Platform fee collection
+      (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+      
+      ;; Update reply tip tracking
+      (map-set replies
+        { reply-id: validated-reply-id }
+        (merge reply-info { tips-received: (+ (get tips-received reply-info) amount) })
+      )
+      
+      ;; Update reputation metrics
+      (let ((sender-rep (get-user-reputation tx-sender))
+            (author-rep (get-user-reputation author)))
+        
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge sender-rep { tips-sent: (+ (get tips-sent sender-rep) amount) })
+        )
+        
+        (map-set user-reputation
+          { user: author }
+          (merge author-rep { tips-received: (+ (get tips-received author-rep) amount) })
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; STAKING SYSTEM
+
+;; Stake STX for platform participation
+(define-public (stake-tokens (amount uint) (lock-duration uint))
+  (let ((current-stake (map-get? user-stakes { user: tx-sender }))
+        (current-time (get-current-time)))
+    
+    (asserts! (>= amount (var-get min-stake-amount)) err-insufficient-stake)
