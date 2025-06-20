@@ -150,6 +150,18 @@
   (is-some (map-get? replies { reply-id: reply-id }))
 )
 
+(define-private (is-valid-thread-id (thread-id uint))
+  (and (> thread-id u0) 
+       (<= thread-id (var-get thread-counter))
+       (is-some (map-get? threads { thread-id: thread-id })))
+)
+
+(define-private (is-valid-parent-reply-enhanced (parent-reply-id uint) (thread-id uint))
+  (and (> parent-reply-id u0)
+       (<= parent-reply-id (var-get reply-counter))
+       (is-valid-parent-reply parent-reply-id thread-id))
+)
+
 ;; READ-ONLY QUERIES
 
 (define-read-only (get-thread (thread-id uint))
@@ -271,10 +283,13 @@
     (asserts! (not (get is-locked thread-info)) err-thread-locked)
     (asserts! (> (len content) u0) err-invalid-amount)
     
-    ;; Validate parent reply if specified
+    ;; Validate parent reply if specified - with explicit checks
     (let ((validated-parent-reply-id 
            (match parent-reply-id
              parent-id (begin
+                         ;; Explicit validation of parent-id
+                         (asserts! (> parent-id u0) err-invalid-parent-reply)
+                         (asserts! (<= parent-id (var-get reply-counter)) err-invalid-parent-reply)
                          (asserts! (is-valid-parent-reply parent-id thread-id) err-invalid-parent-reply)
                          (some parent-id))
              none)))
@@ -467,43 +482,49 @@
 
 ;; Send STX tip to thread author
 (define-public (tip-thread (thread-id uint) (amount uint))
-  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
-        (author (get author thread-info)))
+  (begin
+    ;; Explicit validation of thread-id
+    (asserts! (> thread-id u0) err-not-found)
+    (asserts! (<= thread-id (var-get thread-counter)) err-not-found)
     
-    (asserts! (> amount u0) err-invalid-tip)
-    (asserts! (not (is-eq tx-sender author)) err-self-tip)
-    
-    (let ((platform-fee (calculate-platform-fee amount))
-          (author-payment (- amount platform-fee)))
+    (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
+          (author (get author thread-info)))
       
-      ;; Transfer tip to author
-      (try! (stx-transfer? author-payment tx-sender author))
+      (asserts! (> amount u0) err-invalid-tip)
+      (asserts! (not (is-eq tx-sender author)) err-self-tip)
       
-      ;; Platform fee collection
-      (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
-      
-      ;; Update thread tip tracking
-      (map-set threads
-        { thread-id: thread-id }
-        (merge thread-info { tips-received: (+ (get tips-received thread-info) amount) })
-      )
-      
-      ;; Update reputation metrics
-      (let ((sender-rep (get-user-reputation tx-sender))
-            (author-rep (get-user-reputation author)))
+      (let ((platform-fee (calculate-platform-fee amount))
+            (author-payment (- amount platform-fee)))
         
-        (map-set user-reputation
-          { user: tx-sender }
-          (merge sender-rep { tips-sent: (+ (get tips-sent sender-rep) amount) })
+        ;; Transfer tip to author
+        (try! (stx-transfer? author-payment tx-sender author))
+        
+        ;; Platform fee collection
+        (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+        
+        ;; Update thread tip tracking - now using validated thread-id
+        (map-set threads
+          { thread-id: thread-id }
+          (merge thread-info { tips-received: (+ (get tips-received thread-info) amount) })
         )
         
-        (map-set user-reputation
-          { user: author }
-          (merge author-rep { tips-received: (+ (get tips-received author-rep) amount) })
+        ;; Update reputation metrics
+        (let ((sender-rep (get-user-reputation tx-sender))
+              (author-rep (get-user-reputation author)))
+          
+          (map-set user-reputation
+            { user: tx-sender }
+            (merge sender-rep { tips-sent: (+ (get tips-sent sender-rep) amount) })
+          )
+          
+          (map-set user-reputation
+            { user: author }
+            (merge author-rep { tips-received: (+ (get tips-received author-rep) amount) })
+          )
         )
+        
+        (ok true)
       )
-      
-      (ok true)
     )
   )
 )
@@ -733,4 +754,3 @@
     (ok true)
   )
 )
-
