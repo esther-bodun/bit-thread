@@ -293,3 +293,68 @@
           content: content,
           created-at: current-time,
           upvotes: u0,
+          downvotes: u0,
+          tips-received: u0,
+          parent-reply-id: validated-parent-reply-id
+        }
+      )
+      
+      ;; Increment thread reply counter
+      (map-set threads
+        { thread-id: thread-id }
+        (merge thread-info { reply-count: (+ (get reply-count thread-info) u1) })
+      )
+      
+      ;; Update user reputation metrics
+      (let ((current-rep (get-user-reputation tx-sender)))
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge current-rep
+            {
+              replies-created: (+ (get replies-created current-rep) u1),
+              reputation-score: (calculate-reputation-score
+                (get total-upvotes current-rep)
+                (get total-downvotes current-rep)
+                (get threads-created current-rep)
+                (+ (get replies-created current-rep) u1)
+              )
+            }
+          )
+        )
+      )
+      
+      (var-set reply-counter reply-id)
+      (ok reply-id)
+    )
+  )
+)
+
+;; Purchase premium thread access with STX
+(define-public (purchase-premium-access (thread-id uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
+        (current-time (get-current-time)))
+    
+    (asserts! (get is-premium thread-info) err-thread-not-premium)
+    (asserts! (is-none (map-get? premium-access { thread-id: thread-id, user: tx-sender })) err-unauthorized)
+    
+    (let ((price (get premium-price thread-info))
+          (author (get author thread-info))
+          (platform-fee (calculate-platform-fee price))
+          (author-payment (- price platform-fee)))
+      
+      ;; Process STX payment to author
+      (try! (stx-transfer? author-payment tx-sender author))
+      
+      ;; Platform fee to treasury
+      (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+      
+      ;; Grant premium access
+      (map-set premium-access
+        { thread-id: thread-id, user: tx-sender }
+        { purchased-at: current-time }
+      )
+      
+      (ok true)
+    )
+  )
+)
