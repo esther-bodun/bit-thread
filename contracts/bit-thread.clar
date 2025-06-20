@@ -561,3 +561,101 @@
         (current-time (get-current-time)))
     
     (asserts! (>= amount (var-get min-stake-amount)) err-insufficient-stake)
+    (asserts! (> lock-duration u0) err-invalid-amount)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (match current-stake
+      existing-stake
+      (map-set user-stakes
+        { user: tx-sender }
+        {
+          amount: (+ (get amount existing-stake) amount),
+          locked-until: (+ current-time lock-duration)
+        }
+      )
+      (map-set user-stakes
+        { user: tx-sender }
+        {
+          amount: amount,
+          locked-until: (+ current-time lock-duration)
+        }
+      )
+    )
+    
+    ;; Update staking reputation
+    (let ((current-rep (get-user-reputation tx-sender)))
+      (map-set user-reputation
+        { user: tx-sender }
+        (merge current-rep
+          {
+            staked-amount: (+ (get staked-amount current-rep) amount)
+          }
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Withdraw staked STX after lock period
+(define-public (unstake-tokens (amount uint))
+  (let ((stake-info (unwrap! (map-get? user-stakes { user: tx-sender }) err-not-found))
+        (current-time (get-current-time)))
+    
+    (asserts! (>= current-time (get locked-until stake-info)) err-unauthorized)
+    (asserts! (<= amount (get amount stake-info)) err-insufficient-balance)
+    
+    ;; Return STX to user
+    (try! (as-contract (stx-transfer? amount tx-sender contract-caller)))
+    
+    (let ((remaining-amount (- (get amount stake-info) amount)))
+      (if (> remaining-amount u0)
+        (map-set user-stakes
+          { user: tx-sender }
+          (merge stake-info { amount: remaining-amount })
+        )
+        (map-delete user-stakes { user: tx-sender })
+      )
+    )
+    
+    ;; Update reputation
+    (let ((current-rep (get-user-reputation tx-sender)))
+      (map-set user-reputation
+        { user: tx-sender }
+        (merge current-rep
+          {
+            staked-amount: (- (get staked-amount current-rep) amount)
+          }
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Boost thread visibility with staked tokens
+(define-public (boost-thread (thread-id uint) (boost-amount uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
+        (current-boost (get-thread-boost thread-id))
+        (stake-info (unwrap! (map-get? user-stakes { user: tx-sender }) err-insufficient-stake)))
+    
+    (asserts! (is-user-staked tx-sender) err-insufficient-stake)
+    (asserts! (<= boost-amount (get amount stake-info)) err-insufficient-balance)
+    (asserts! (> boost-amount u0) err-invalid-amount)
+    (asserts! (is-some (get-thread thread-id)) err-not-found)
+    
+    ;; Update thread boost metrics
+    (let ((verified-thread-id thread-id)
+          (verified-boost-amount boost-amount)
+          (current-boost-amount (get boost-amount current-boost))
+          (current-boosted-by (get boosted-by current-boost)))
+      
+      (map-set thread-boosts
+        { thread-id: verified-thread-id }
+        {
+          boost-amount: (+ current-boost-amount verified-boost-amount),
+          boosted-by: (unwrap! (as-max-len? (append current-boosted-by tx-sender) u20) err-unauthorized)
