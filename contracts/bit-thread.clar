@@ -194,3 +194,102 @@
     )
   )
 )
+
+(define-read-only (get-user-vote-on-thread (thread-id uint) (user principal))
+  (map-get? thread-votes { thread-id: thread-id, voter: user })
+)
+
+(define-read-only (get-user-vote-on-reply (reply-id uint) (user principal))
+  (map-get? reply-votes { reply-id: reply-id, voter: user })
+)
+
+(define-read-only (get-thread-boost (thread-id uint))
+  (default-to
+    { boost-amount: u0, boosted-by: (list) }
+    (map-get? thread-boosts { thread-id: thread-id })
+  )
+)
+
+;; CORE FUNCTIONS
+
+;; Create new discussion thread
+(define-public (create-thread (title (string-utf8 256)) (content (string-utf8 2048)) (is-premium bool) (premium-price uint))
+  (let ((thread-id (+ (var-get thread-counter) u1))
+        (current-time (get-current-time)))
+    (asserts! (is-user-staked tx-sender) err-insufficient-stake)
+    (asserts! (> (len title) u0) err-invalid-amount)
+    (asserts! (> (len content) u0) err-invalid-amount)
+    (asserts! (or (not is-premium) (> premium-price u0)) err-invalid-amount)
+    
+    (map-set threads
+      { thread-id: thread-id }
+      {
+        author: tx-sender,
+        title: title,
+        content: content,
+        is-premium: is-premium,
+        premium-price: premium-price,
+        created-at: current-time,
+        upvotes: u0,
+        downvotes: u0,
+        tips-received: u0,
+        is-locked: false,
+        reply-count: u0
+      }
+    )
+    
+    ;; Update creator reputation
+    (let ((current-rep (get-user-reputation tx-sender)))
+      (map-set user-reputation
+        { user: tx-sender }
+        (merge current-rep
+          {
+            threads-created: (+ (get threads-created current-rep) u1),
+            reputation-score: (calculate-reputation-score
+              (get total-upvotes current-rep)
+              (get total-downvotes current-rep)
+              (+ (get threads-created current-rep) u1)
+              (get replies-created current-rep)
+            )
+          }
+        )
+      )
+    )
+    
+    (var-set thread-counter thread-id)
+    (ok thread-id)
+  )
+)
+
+;; Create threaded reply with validation
+(define-public (create-reply (thread-id uint) (content (string-utf8 1024)) (parent-reply-id (optional uint)))
+  (let ((reply-id (+ (var-get reply-counter) u1))
+        (current-time (get-current-time))
+        (thread-info (unwrap! (get-thread thread-id) err-not-found)))
+    
+    (asserts! (is-user-staked tx-sender) err-insufficient-stake)
+    (asserts! (not (get is-locked thread-info)) err-thread-locked)
+    (asserts! (> (len content) u0) err-invalid-amount)
+    
+    ;; Validate parent reply if specified
+    (let ((validated-parent-reply-id 
+           (match parent-reply-id
+             parent-id (begin
+                         (asserts! (is-valid-parent-reply parent-id thread-id) err-invalid-parent-reply)
+                         (some parent-id))
+             none)))
+      
+      ;; Check premium access requirements
+      (if (get is-premium thread-info)
+        (asserts! (has-premium-access thread-id tx-sender) err-thread-not-premium)
+        true
+      )
+      
+      (map-set replies
+        { reply-id: reply-id }
+        {
+          thread-id: thread-id,
+          author: tx-sender,
+          content: content,
+          created-at: current-time,
+          upvotes: u0,
