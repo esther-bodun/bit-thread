@@ -150,6 +150,18 @@
   (is-some (map-get? replies { reply-id: reply-id }))
 )
 
+(define-private (is-valid-thread-id (thread-id uint))
+  (and (> thread-id u0) 
+       (<= thread-id (var-get thread-counter))
+       (is-some (map-get? threads { thread-id: thread-id })))
+)
+
+(define-private (is-valid-parent-reply-enhanced (parent-reply-id uint) (thread-id uint))
+  (and (> parent-reply-id u0)
+       (<= parent-reply-id (var-get reply-counter))
+       (is-valid-parent-reply parent-reply-id thread-id))
+)
+
 ;; READ-ONLY QUERIES
 
 (define-read-only (get-thread (thread-id uint))
@@ -271,10 +283,13 @@
     (asserts! (not (get is-locked thread-info)) err-thread-locked)
     (asserts! (> (len content) u0) err-invalid-amount)
     
-    ;; Validate parent reply if specified
+    ;; Validate parent reply if specified - with explicit checks
     (let ((validated-parent-reply-id 
            (match parent-reply-id
              parent-id (begin
+                         ;; Explicit validation of parent-id
+                         (asserts! (> parent-id u0) err-invalid-parent-reply)
+                         (asserts! (<= parent-id (var-get reply-counter)) err-invalid-parent-reply)
                          (asserts! (is-valid-parent-reply parent-id thread-id) err-invalid-parent-reply)
                          (some parent-id))
              none)))
@@ -356,5 +371,386 @@
       
       (ok true)
     )
+  )
+)
+
+;; VOTING SYSTEM
+
+;; Vote on thread content
+(define-public (vote-thread (thread-id uint) (is-upvote bool))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
+        (existing-vote (map-get? thread-votes { thread-id: thread-id, voter: tx-sender })))
+    
+    (asserts! (is-user-staked tx-sender) err-insufficient-stake)
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (not (is-eq tx-sender (get author thread-info))) err-unauthorized)
+    
+    (map-set thread-votes
+      { thread-id: thread-id, voter: tx-sender }
+      { vote-type: is-upvote }
+    )
+    
+    (let ((new-upvotes (if is-upvote (+ (get upvotes thread-info) u1) (get upvotes thread-info)))
+          (new-downvotes (if is-upvote (get downvotes thread-info) (+ (get downvotes thread-info) u1))))
+      
+      (map-set threads
+        { thread-id: thread-id }
+        (merge thread-info
+          {
+            upvotes: new-upvotes,
+            downvotes: new-downvotes
+          }
+        )
+      )
+      
+      ;; Update author reputation
+      (let ((author-rep (get-user-reputation (get author thread-info))))
+        (map-set user-reputation
+          { user: (get author thread-info) }
+          (merge author-rep
+            {
+              total-upvotes: (if is-upvote (+ (get total-upvotes author-rep) u1) (get total-upvotes author-rep)),
+              total-downvotes: (if is-upvote (get total-downvotes author-rep) (+ (get total-downvotes author-rep) u1)),
+              reputation-score: (calculate-reputation-score
+                (if is-upvote (+ (get total-upvotes author-rep) u1) (get total-upvotes author-rep))
+                (if is-upvote (get total-downvotes author-rep) (+ (get total-downvotes author-rep) u1))
+                (get threads-created author-rep)
+                (get replies-created author-rep)
+              )
+            }
+          )
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Vote on reply content
+(define-public (vote-reply (reply-id uint) (is-upvote bool))
+  (let ((reply-info (unwrap! (get-reply reply-id) err-not-found))
+        (existing-vote (map-get? reply-votes { reply-id: reply-id, voter: tx-sender })))
+    
+    (asserts! (is-user-staked tx-sender) err-insufficient-stake)
+    (asserts! (is-none existing-vote) err-already-voted)
+    (asserts! (not (is-eq tx-sender (get author reply-info))) err-unauthorized)
+    
+    (map-set reply-votes
+      { reply-id: reply-id, voter: tx-sender }
+      { vote-type: is-upvote }
+    )
+    
+    (let ((new-upvotes (if is-upvote (+ (get upvotes reply-info) u1) (get upvotes reply-info)))
+          (new-downvotes (if is-upvote (get downvotes reply-info) (+ (get downvotes reply-info) u1))))
+      
+      (map-set replies
+        { reply-id: reply-id }
+        (merge reply-info
+          {
+            upvotes: new-upvotes,
+            downvotes: new-downvotes
+          }
+        )
+      )
+      
+      ;; Update author reputation
+      (let ((author-rep (get-user-reputation (get author reply-info))))
+        (map-set user-reputation
+          { user: (get author reply-info) }
+          (merge author-rep
+            {
+              total-upvotes: (if is-upvote (+ (get total-upvotes author-rep) u1) (get total-upvotes author-rep)),
+              total-downvotes: (if is-upvote (get total-downvotes author-rep) (+ (get total-downvotes author-rep) u1)),
+              reputation-score: (calculate-reputation-score
+                (if is-upvote (+ (get total-upvotes author-rep) u1) (get total-upvotes author-rep))
+                (if is-upvote (get total-downvotes author-rep) (+ (get total-downvotes author-rep) u1))
+                (get threads-created author-rep)
+                (get replies-created author-rep)
+              )
+            }
+          )
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; TIPPING ECONOMY
+
+;; Send STX tip to thread author
+(define-public (tip-thread (thread-id uint) (amount uint))
+  (begin
+    ;; Explicit validation of thread-id
+    (asserts! (> thread-id u0) err-not-found)
+    (asserts! (<= thread-id (var-get thread-counter)) err-not-found)
+    
+    (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
+          (author (get author thread-info)))
+      
+      (asserts! (> amount u0) err-invalid-tip)
+      (asserts! (not (is-eq tx-sender author)) err-self-tip)
+      
+      (let ((platform-fee (calculate-platform-fee amount))
+            (author-payment (- amount platform-fee)))
+        
+        ;; Transfer tip to author
+        (try! (stx-transfer? author-payment tx-sender author))
+        
+        ;; Platform fee collection
+        (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+        
+        ;; Update thread tip tracking - now using validated thread-id
+        (map-set threads
+          { thread-id: thread-id }
+          (merge thread-info { tips-received: (+ (get tips-received thread-info) amount) })
+        )
+        
+        ;; Update reputation metrics
+        (let ((sender-rep (get-user-reputation tx-sender))
+              (author-rep (get-user-reputation author)))
+          
+          (map-set user-reputation
+            { user: tx-sender }
+            (merge sender-rep { tips-sent: (+ (get tips-sent sender-rep) amount) })
+          )
+          
+          (map-set user-reputation
+            { user: author }
+            (merge author-rep { tips-received: (+ (get tips-received author-rep) amount) })
+          )
+        )
+        
+        (ok true)
+      )
+    )
+  )
+)
+
+;; Send STX tip to reply author
+(define-public (tip-reply (reply-id uint) (amount uint))
+  (let ((reply-info (unwrap! (get-reply reply-id) err-not-found))
+        (author (get author reply-info)))
+    
+    (asserts! (is-valid-reply-id reply-id) err-not-found)
+    (asserts! (> amount u0) err-invalid-tip)
+    (asserts! (not (is-eq tx-sender author)) err-self-tip)
+    
+    (let ((platform-fee (calculate-platform-fee amount))
+          (author-payment (- amount platform-fee))
+          (validated-reply-id reply-id))
+      
+      ;; Transfer tip to author
+      (try! (stx-transfer? author-payment tx-sender author))
+      
+      ;; Platform fee collection
+      (try! (stx-transfer? platform-fee tx-sender (var-get platform-treasury)))
+      
+      ;; Update reply tip tracking
+      (map-set replies
+        { reply-id: validated-reply-id }
+        (merge reply-info { tips-received: (+ (get tips-received reply-info) amount) })
+      )
+      
+      ;; Update reputation metrics
+      (let ((sender-rep (get-user-reputation tx-sender))
+            (author-rep (get-user-reputation author)))
+        
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge sender-rep { tips-sent: (+ (get tips-sent sender-rep) amount) })
+        )
+        
+        (map-set user-reputation
+          { user: author }
+          (merge author-rep { tips-received: (+ (get tips-received author-rep) amount) })
+        )
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; STAKING SYSTEM
+
+;; Stake STX for platform participation
+(define-public (stake-tokens (amount uint) (lock-duration uint))
+  (let ((current-stake (map-get? user-stakes { user: tx-sender }))
+        (current-time (get-current-time)))
+    
+    (asserts! (>= amount (var-get min-stake-amount)) err-insufficient-stake)
+    (asserts! (> lock-duration u0) err-invalid-amount)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (match current-stake
+      existing-stake
+      (map-set user-stakes
+        { user: tx-sender }
+        {
+          amount: (+ (get amount existing-stake) amount),
+          locked-until: (+ current-time lock-duration)
+        }
+      )
+      (map-set user-stakes
+        { user: tx-sender }
+        {
+          amount: amount,
+          locked-until: (+ current-time lock-duration)
+        }
+      )
+    )
+    
+    ;; Update staking reputation
+    (let ((current-rep (get-user-reputation tx-sender)))
+      (map-set user-reputation
+        { user: tx-sender }
+        (merge current-rep
+          {
+            staked-amount: (+ (get staked-amount current-rep) amount)
+          }
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Withdraw staked STX after lock period
+(define-public (unstake-tokens (amount uint))
+  (let ((stake-info (unwrap! (map-get? user-stakes { user: tx-sender }) err-not-found))
+        (current-time (get-current-time)))
+    
+    (asserts! (>= current-time (get locked-until stake-info)) err-unauthorized)
+    (asserts! (<= amount (get amount stake-info)) err-insufficient-balance)
+    
+    ;; Return STX to user
+    (try! (as-contract (stx-transfer? amount tx-sender contract-caller)))
+    
+    (let ((remaining-amount (- (get amount stake-info) amount)))
+      (if (> remaining-amount u0)
+        (map-set user-stakes
+          { user: tx-sender }
+          (merge stake-info { amount: remaining-amount })
+        )
+        (map-delete user-stakes { user: tx-sender })
+      )
+    )
+    
+    ;; Update reputation
+    (let ((current-rep (get-user-reputation tx-sender)))
+      (map-set user-reputation
+        { user: tx-sender }
+        (merge current-rep
+          {
+            staked-amount: (- (get staked-amount current-rep) amount)
+          }
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Boost thread visibility with staked tokens
+(define-public (boost-thread (thread-id uint) (boost-amount uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found))
+        (current-boost (get-thread-boost thread-id))
+        (stake-info (unwrap! (map-get? user-stakes { user: tx-sender }) err-insufficient-stake)))
+    
+    (asserts! (is-user-staked tx-sender) err-insufficient-stake)
+    (asserts! (<= boost-amount (get amount stake-info)) err-insufficient-balance)
+    (asserts! (> boost-amount u0) err-invalid-amount)
+    (asserts! (is-some (get-thread thread-id)) err-not-found)
+    
+    ;; Update thread boost metrics
+    (let ((verified-thread-id thread-id)
+          (verified-boost-amount boost-amount)
+          (current-boost-amount (get boost-amount current-boost))
+          (current-boosted-by (get boosted-by current-boost)))
+      
+      (map-set thread-boosts
+        { thread-id: verified-thread-id }
+        {
+          boost-amount: (+ current-boost-amount verified-boost-amount),
+          boosted-by: (unwrap! (as-max-len? (append current-boosted-by tx-sender) u20) err-unauthorized)
+          }
+      )
+    )
+    
+    ;; Allocate staked tokens to boost
+    (map-set user-stakes
+      { user: tx-sender }
+      (merge stake-info { amount: (- (get amount stake-info) boost-amount) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; CONTENT MODERATION
+
+;; Toggle thread lock status (author only)
+(define-public (toggle-thread-lock (thread-id uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get author thread-info)) err-unauthorized)
+    
+    (map-set threads
+      { thread-id: thread-id }
+      (merge thread-info { is-locked: (not (get is-locked thread-info)) })
+    )
+    
+    (ok (not (get is-locked thread-info)))
+  )
+)
+
+;; NFT MILESTONES
+
+;; Mint achievement NFT for viral threads
+(define-public (mint-milestone-nft (thread-id uint))
+  (let ((thread-info (unwrap! (get-thread thread-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get author thread-info)) err-unauthorized)
+    (asserts! (>= (get upvotes thread-info) u100) err-unauthorized)
+    
+    (try! (nft-mint? thread-milestone thread-id tx-sender))
+    (ok thread-id)
+  )
+)
+
+;; ADMIN FUNCTIONS
+
+;; Update platform fee structure
+(define-public (set-platform-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u1000) err-invalid-amount)
+    (var-set platform-fee-rate new-rate)
+    (ok true)
+  )
+)
+
+;; Adjust minimum staking requirements
+(define-public (set-min-stake-amount (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-amount u0) err-invalid-amount)
+    (var-set min-stake-amount new-amount)
+    (ok true)
+  )
+)
+
+;; Update platform treasury address
+(define-public (set-platform-treasury (new-treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (is-eq new-treasury 'SP000000000000000000002Q6VF78)) err-invalid-amount)
+    (var-set platform-treasury new-treasury)
+    (ok true)
   )
 )
